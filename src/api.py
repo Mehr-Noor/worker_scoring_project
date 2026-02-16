@@ -1,91 +1,80 @@
 # فایل: src/api.py
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict
 import pandas as pd
 import joblib
-from io import BytesIO
 
-from src.data_processing import preprocess_data
+from src.data_processing import preprocess_data, generate_synthetic_data
 from src.scoring import decision_logic
+from src.fairness import demographic_parity, disparate_impact
 
 app = FastAPI(
-    title="Worker Scoring & Decision API",
-    description="ML-based scoring and decision system for hospital workforce staffing",
-    version="1.0"
+    title="Worker Scoring API",
+    description="ML system for scoring hospital candidates with fairness evaluation",
+    version="1.0.0"
 )
 
-# --------------------------------------------------
-# Load trained models
-# --------------------------------------------------
-lr_bundle = joblib.load("src/logistic_model.pkl")
-lr_model = lr_bundle["model"]
-decision_threshold = lr_bundle["threshold"]
+# -------------------------------
+# Request models
+# -------------------------------
+class Candidate(BaseModel):
+    features: Dict[str, float]
 
+class BatchCandidates(BaseModel):
+    candidates: List[Candidate]
 
-# --------------------------------------------------
-# Pydantic input schema (IMPORTANT)
-# --------------------------------------------------
-class CandidateInput(BaseModel):
-    age: int = Field(..., example=30)
-    gender: str = Field(..., example="Female")
-    icu_experience: int = Field(..., example=3)
-    cpr_skill: int = Field(..., example=4)
-    language_level: str = Field(..., example="B1")
-    previous_score: int = Field(..., example=85)
-    region: str = Field(..., example="North")
+# -------------------------------
+# Load models at startup
+# -------------------------------
+lr_pipeline = joblib.load("src/logistic_model.pkl")
+xgb_pipeline = joblib.load("src/xgb_model.pkl")
 
+# -------------------------------
+# Prediction endpoints
+# -------------------------------
+@app.post("/predict/candidate")
+def predict_candidate(candidate: Candidate):
+    df = pd.DataFrame([candidate.features])
+    lr_model = lr_pipeline["model"]
+    threshold = lr_pipeline["threshold"]
+    prob = lr_model.predict_proba(df)[:, 1][0]
+    decision = "Pass" if prob >= threshold else "Fail"
+    return {"probability": prob, "decision": decision}
 
-# --------------------------------------------------
-# Root
-# --------------------------------------------------
-@app.get("/")
-def root():
-    return {"message": "Worker Scoring API is running"}
+@app.post("/predict/batch")
+def predict_batch(batch: BatchCandidates):
+    df = pd.DataFrame([c.features for c in batch.candidates])
+    lr_model = lr_pipeline["model"]
+    threshold = lr_pipeline["threshold"]
+    probs = lr_model.predict_proba(df)[:, 1]
+    decisions = ["Pass" if p >= threshold else "Fail" for p in probs]
+    return {"probabilities": probs.tolist(), "decisions": decisions}
 
-
-# --------------------------------------------------
-# Real-time inference
-# --------------------------------------------------
-@app.post("/predict")
-def predict_candidate(candidate: CandidateInput):
+# -------------------------------
+# Fairness endpoint
+# -------------------------------
+@app.get("/fairness")
+def get_fairness():
+    """
+    Compute Demographic Parity & Disparate Impact on synthetic data.
+    """
     try:
-        df = pd.DataFrame([candidate.dict()])
-        df_processed = preprocess_data(df)
-
-        prob = lr_model.predict_proba(df_processed.values)[:, 1][0]
-
-        decision, risk = decision_logic(prob)
-
+        # Generate or load dataset
+        data = generate_synthetic_data()
+        # Fairness metrics
+        dp_gender = demographic_parity(data, "gender")
+        di_gender = disparate_impact(data, "gender", reference_group="Male")
+        dp_region = demographic_parity(data, "region")
         return {
-            "score": round(float(prob), 3),
-            "decision": decision,
-            "risk_level": risk
+            "demographic_parity": {
+                "gender": dp_gender,
+                "region": dp_region
+            },
+            "disparate_impact": {
+                "gender": di_gender
+            }
         }
-
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# --------------------------------------------------
-# Batch inference
-# --------------------------------------------------
-@app.post("/predict_batch")
-def predict_batch(file: UploadFile = File(...)):
-    try:
-        contents = file.file.read()
-        df = pd.read_csv(BytesIO(contents))
-
-        df_processed = preprocess_data(df)
-        probs = lr_model.predict_proba(df_processed.values)[:, 1]
-
-        decisions = [decision_logic(p) for p in probs]
-
-        df["score"] = probs
-        df["decision"] = [d[0] for d in decisions]
-        df["risk_level"] = [d[1] for d in decisions]
-
-        return df.to_dict(orient="records")
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
